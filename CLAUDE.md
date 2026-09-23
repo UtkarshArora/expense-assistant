@@ -26,7 +26,14 @@ npm run build    # tsc -b typecheck + vite build
 npm run lint     # oxlint
 ```
 
-There is no test suite. Manual check queries: "What did Engineering spend on software in Q2?" (DB only), "What's the per-attendee cap for client meals?" (docs only), "What client meals did Sales have last quarter, and were any over the policy cap?" (both).
+Tests (from `backend/`, needs `pip install -r requirements-dev.txt`; no database or API key required):
+
+```bash
+python -m pytest                                    # all
+python -m pytest tests/test_sql_guard.py -k comment # one group
+```
+
+`tests/test_sql_guard.py` covers the `query_db` guard with `psycopg.connect` mocked; every rejection case asserts the connection was never opened. Manual check queries: "What did Engineering spend on software in Q2?" (DB only), "What's the per-attendee cap for client meals?" (docs only), "What client meals did Sales have last quarter, and were any over the policy cap?" (both).
 
 ## Architecture
 
