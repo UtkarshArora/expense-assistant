@@ -13,7 +13,8 @@ async) on PostgreSQL. The agent calls the Anthropic API directly via
 
 Single-user, local-only. No auth, no multi-tenancy, no RAG (`search_files`
 is a glob + read over the docs folder, not embeddings), chat is
-non-streaming. Built to be read end to end, not extended.
+non-streaming. Built to be read end to end. Known gaps are listed under
+[Known limitations](#known-limitations).
 
 ---
 
@@ -84,7 +85,7 @@ uvicorn app.main:app --reload --port 8000
 
 Swagger UI at `http://localhost:8000/docs`. On startup the backend also
 creates its own tables (`conversation`, `message`, `toolcall`) if they're
-missing — separate from `expenses`, which belongs to `seed_expenses.sql`.
+missing, separate from `expenses`, which belongs to `seed_expenses.sql`.
 
 **4. Frontend**
 
@@ -118,22 +119,22 @@ the answer.
 locally and sends results back as `tool_result` blocks keyed by
 `tool_use_id`. Loops until the model answers with plain text instead of
 another tool call. `minimal_agent.py` at the repo root is the same loop
-in isolation, without the Postgres/FastAPI wiring — useful for seeing the
+in isolation, without the Postgres/FastAPI wiring, useful for seeing the
 shape on its own.
 
 `query_db` is locked to a single read-only `SELECT` (regex-checked, run
 in a read-only transaction) since the SQL text is model-generated.
 `search_files` reads and returns file contents from `docs/`, not just
-matching paths — the agent needs the policy text itself.
+matching paths, since the agent needs the policy text itself.
 
 The Anthropic call is synchronous, so `POST /chat` runs `run_agent` in a
-worker thread via `asyncio.to_thread` rather than making the loop async —
-keeps the loop itself simple and only makes the call site async-aware.
+worker thread via `asyncio.to_thread` rather than making the loop async.
+This keeps the loop itself simple and only makes the call site async-aware.
 
 ### FastAPI's async model
 
 `async def` handlers don't block the event loop while awaiting I/O, so
-one worker process can serve many requests concurrently — while one
+one worker process can serve many requests concurrently. While one
 request waits on Postgres, the loop works on another. That only holds if
 everything in the request path is `async` or explicitly offloaded: a
 blocking call made directly inside a handler (like the Anthropic SDK
@@ -154,7 +155,7 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 Routes declare `session: AsyncSession = Depends(get_session)`. FastAPI
 calls the generator, hands the session to the route, then resumes the
-generator to close it once the route returns — success or failure. A
+generator to close it once the route returns, on success or failure. A
 session's lifetime is exactly one request; nothing has to close one
 manually.
 
@@ -167,7 +168,7 @@ message, runs the agent, writes the assistant reply and its tool calls,
 commits once. `GET /conversations/{id}` reads it all back joined for the
 frontend's trace panel.
 
-`expenses` is deliberately not one of these SQLModel tables — it belongs
+`expenses` is deliberately not one of these SQLModel tables. It belongs
 to `seed_expenses.sql` and lives in the same database, but the ORM
 doesn't know about it. `query_db` talks to it over a separate `psycopg`
 connection.
@@ -176,9 +177,50 @@ connection.
 
 Plain `fetch` (`src/api.ts`), no data-fetching library. `App.tsx` owns
 the conversation list, active messages, and a `pending` flag, and is the
-only thing that calls the API — everything else is presentational.
+only thing that calls the API. Everything else is presentational.
 Sending a message appends the user's text immediately, then appends the
 real assistant message (with `tool_calls`) once the response lands.
 Assistant text renders through `react-markdown` (the model returns tables
 and bold text fairly often); tool calls show in a collapsible
 `ToolCallTrace` built on a vendored Radix `Collapsible`.
+
+---
+
+## Known limitations
+
+This is a single-user demo. These are the gaps I'd close before running it
+for real users.
+
+- **A failed Anthropic call fails the whole request.** The call isn't wrapped
+  in error handling, so the request returns a 500 and the transaction rolls
+  back, including the user's message.
+- **A database transaction stays open during the agent run.** The user
+  message is flushed before `run_agent` and committed only at the end, so
+  each request holds a pooled connection for the full run. Under concurrent
+  load, the default pool (5 plus 10 overflow) is the first bottleneck.
+- ** There is no `statement_timeout`, and `fetchmany(500)` limits rows returned, not the
+  work Postgres does.
+- **`query_db` opens a new connection on every call,** outside the app's
+  connection pool.
+
+## Planned improvements
+
+In priority order:
+
+1. **Shorter transactions.** Commit the user message before the agent runs,
+   then save the reply and tool calls in a separate short transaction.
+2. **Least-privilege queries.** Run `query_db` as a dedicated Postgres role
+   with `SELECT` on `expenses` only, add a `statement_timeout`, and reuse
+   pooled connections.
+3. **Eval suite.** 30 to 50 questions with known answers from reference SQL,
+   covering DB-only, docs-only, combined, edge-case, and adversarial prompts.
+   Compare query results rather than SQL text, check that the right tools
+   were called, use an LLM judge for policy answers, run each question
+   several times, and fail CI if the pass rate drops. Pin the model version.
+4. **Streaming responses,** so the UI shows tool calls as they happen instead
+   of a spinner.
+5. **Concurrency.** Replace `asyncio.to_thread` with `AsyncAnthropic`, or hand
+   agent runs to background workers through a job queue.
+6. **A framework version for comparison.** Port the loop to LangGraph
+   alongside the hand-written one, to compare what the framework adds (state,
+   checkpointing, step limits) against the plain loop.
