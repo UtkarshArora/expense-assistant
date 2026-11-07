@@ -20,6 +20,14 @@ class Settings:
 
     docs_dir: Path = BASE_DIR / "docs"
 
+    # Auth0: access tokens are RS256 JWTs issued by this tenant for this API.
+    # Neither value is a secret; the backend never holds an Auth0 secret.
+    auth0_domain: str = os.environ["AUTH0_DOMAIN"]
+    auth0_audience: str = os.environ["AUTH0_AUDIENCE"]
+
+    # Per-user cap on chat messages per UTC day, to bound API spend.
+    daily_message_limit: int = int(os.environ.get("DAILY_MESSAGE_LIMIT", "50"))
+
     cors_origins: list[str] = os.environ.get(
         "CORS_ORIGINS", "http://localhost:5173"
     ).split(",")

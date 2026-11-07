@@ -4,8 +4,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..auth import get_current_user
 from ..db import get_session
-from ..models import Conversation, Message, ToolCall
+from ..models import Conversation, Message, ToolCall, User
 from ..schemas import ConversationDetailOut, ConversationOut, MessageOut, ToolCallOut
 
 router = APIRouter()
@@ -13,10 +14,13 @@ router = APIRouter()
 
 @router.get("/conversations", response_model=list[ConversationOut])
 async def list_conversations(
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[ConversationOut]:
     result = await session.execute(
-        select(Conversation).order_by(Conversation.created_at.desc())
+        select(Conversation)
+        .where(Conversation.user_id == user.id)
+        .order_by(Conversation.created_at.desc())
     )
     return [
         ConversationOut(id=c.id, title=c.title, created_at=c.created_at)
@@ -26,10 +30,13 @@ async def list_conversations(
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationDetailOut)
 async def get_conversation(
-    conversation_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    conversation_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> ConversationDetailOut:
     conversation = await session.get(Conversation, conversation_id)
-    if conversation is None:
+    # Someone else's conversation looks exactly like a missing one.
+    if conversation is None or conversation.user_id != user.id:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     messages = (

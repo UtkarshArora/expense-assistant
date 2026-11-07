@@ -13,8 +13,29 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+class User(SQLModel, table=True):
+    """Local mirror of an Auth0 user, upserted from token claims per request.
+
+    Auth0 is the source of truth for role/department/employee_name; these
+    columns are refreshed on every authenticated request.
+    """
+
+    __tablename__ = "app_user"  # "user" is a reserved word in Postgres
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    auth0_sub: str = Field(unique=True, index=True)
+    email: str | None = None
+    display_name: str | None = None
+    role: str  # "employee" | "manager" | "admin"
+    department: str | None = None
+    employee_name: str | None = None
+    created_at: NaiveDatetime = Field(default_factory=utcnow)
+    last_seen_at: NaiveDatetime = Field(default_factory=utcnow)
+
+
 class Conversation(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="app_user.id", index=True)
     title: str = "New conversation"
     created_at: NaiveDatetime = Field(default_factory=utcnow)
 

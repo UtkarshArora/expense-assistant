@@ -7,6 +7,8 @@ import pytest
 # app.config reads ANTHROPIC_API_KEY at import time; the guard tests never
 # call the API, so a placeholder is enough when no real key is set.
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+os.environ.setdefault("AUTH0_DOMAIN", "test-tenant.auth0.local")
+os.environ.setdefault("AUTH0_AUDIENCE", "https://expense-assistant-api")
 
 from app import agent  # noqa: E402
 

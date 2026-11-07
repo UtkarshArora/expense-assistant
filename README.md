@@ -6,15 +6,17 @@ both, runs the tool(s), and answers with the tool calls shown alongside
 the reply.
 
 Stack: React/TypeScript (Vite, Tailwind, ShadCN) on FastAPI (Python,
-async) on PostgreSQL. The agent calls the Anthropic API directly via
-`client.messages.create` in the Python SDK, no agent framework.
+async) on PostgreSQL, with Auth0 for sign-in. The agent calls the
+Anthropic API directly via `client.messages.create` in the Python SDK, no
+agent framework.
 
 ## Scope
 
-Single-user, local-only. No auth, no multi-tenancy, no RAG (`search_files`
-is a glob + read over the docs folder, not embeddings), chat is
-non-streaming. Built to be read end to end. Known gaps are listed under
-[Known limitations](#known-limitations).
+Invite-only and multi-user: users sign in with Auth0, each sees only their
+own conversations, and each has a role (employee, manager, admin). No RAG
+(`search_files` is a glob + read over the docs folder, not embeddings),
+chat is non-streaming. Built to be read end to end. Known gaps are listed
+under [Known limitations](#known-limitations).
 
 ---
 
@@ -26,6 +28,8 @@ Agent/
 ├── seed_expenses.sql        # creates + seeds the `expenses` table
 ├── docs/                    # policy markdown, read by search_files
 ├── minimal_agent.py          # standalone reference version of the agent loop
+├── auth0/
+│   └── post-login-action.js  # reference copy of the Auth0 Action that adds role claims
 ├── backend/
 │   ├── requirements.txt
 │   └── app/
@@ -35,14 +39,20 @@ Agent/
 │       ├── models.py         # Conversation / Message / ToolCall (SQLModel)
 │       ├── schemas.py        # request/response shapes
 │       ├── agent.py          # the agent loop + its two tools
+│       ├── auth.py           # Auth0 JWT verification, current-user dependency
 │       └── routers/
 │           ├── chat.py             # POST /chat
-│           └── conversations.py    # GET /conversations, GET /conversations/{id}
+│           ├── conversations.py    # GET /conversations, GET /conversations/{id}
+│           └── me.py               # GET /me
 └── frontend/
     └── src/
-        ├── api.ts                     # fetch wrapper + types matching the backend schemas
-        ├── App.tsx                    # top-level state: conversations, messages, send
+        ├── main.tsx                   # Auth0Provider
+        ├── App.tsx                    # auth gate: login page or the chat app
+        ├── ChatApp.tsx                # top-level state: conversations, messages, send
+        ├── api.ts                     # fetch wrapper (Bearer token) + types matching the backend schemas
+        ├── useApi.ts                  # the API client bound to the user's access token
         └── components/
+            ├── LoginPage.tsx
             ├── ConversationSidebar.tsx
             ├── ChatView.tsx / MessageList.tsx / MessageBubble.tsx
             ├── ToolCallTrace.tsx      # collapsible per-message tool-call panel
@@ -55,14 +65,42 @@ Agent/
 
 Needs Docker, Python 3.11+, Node 20+.
 
-**1. Env vars**
+**1. Auth0 tenant** (free tier; one-time)
+
+In the Auth0 dashboard:
+
+1. **API** (Applications → APIs → Create API): identifier
+   `https://expense-assistant-api`, RS256. Turn on *Allow Offline Access*.
+2. **Application** (Applications → Create Application → *Single Page Web
+   Applications*). Set Allowed Callback URLs, Logout URLs and Web Origins to
+   `http://localhost:5173`, and turn on Refresh Token Rotation. On its
+   *Connections* tab, enable only *Username-Password-Authentication*.
+   A social connection would let anyone in.
+3. **Disable sign-ups** (Authentication → Database →
+   Username-Password-Authentication). Only users you create can log in.
+4. **Roles** (User Management → Roles): `employee`, `manager`, `admin`.
+5. **Users** (User Management → Users): create them, assign one role each,
+   and set `app_metadata` (not `user_metadata`, which users can edit), e.g.
+   `{"department": "Sales", "employee_name": "Marcus Chen"}`. Values must
+   match `seed_expenses.sql` exactly.
+6. **Action**: create a Post Login Action from
+   [`auth0/post-login-action.js`](auth0/post-login-action.js), deploy it,
+   and add it to Actions → Triggers → post-login. It puts role, department
+   and employee name into the access token, and denies login to anyone
+   without a role.
+
+There's no client secret anywhere in this setup: the SPA signs in with
+PKCE, and the backend only verifies tokens against the tenant's public
+keys.
+
+**2. Env vars**
 
 ```bash
-cp .env.example .env
-# set ANTHROPIC_API_KEY
+cp .env.example .env                       # ANTHROPIC_API_KEY, AUTH0_DOMAIN, AUTH0_AUDIENCE
+cp frontend/.env.example frontend/.env.local   # VITE_AUTH0_DOMAIN, VITE_AUTH0_CLIENT_ID, VITE_AUTH0_AUDIENCE
 ```
 
-**2. Postgres**
+**3. Postgres**
 
 ```bash
 docker compose up -d db
@@ -73,7 +111,7 @@ build and populate the `expenses` table (mounted into Postgres's
 `docker-entrypoint-initdb.d/`). Changed the seed data and want it to
 re-run? Drop the volume first: `docker compose down -v`.
 
-**3. Backend**
+**4. Backend**
 
 ```bash
 cd backend
@@ -84,10 +122,12 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 Swagger UI at `http://localhost:8000/docs`. On startup the backend also
-creates its own tables (`conversation`, `message`, `toolcall`) if they're
-missing, separate from `expenses`, which belongs to `seed_expenses.sql`.
+creates its own tables (`app_user`, `conversation`, `message`, `toolcall`)
+if they're missing, separate from `expenses`, which belongs to
+`seed_expenses.sql`. It never alters existing tables, so after a schema
+change run `docker compose down -v` (this wipes local chats).
 
-**4. Frontend**
+**5. Frontend**
 
 ```bash
 cd frontend
@@ -97,7 +137,7 @@ npm run dev
 
 `http://localhost:5173`.
 
-**5. Try it**
+**6. Try it**
 
 - DB only: "What did Engineering spend on software in Q2?"
 - Docs only: "What's the per-attendee cap for client meals?"
@@ -113,12 +153,17 @@ the answer.
 
 ### Agent loop
 
-`backend/app/agent.py`: a `while True` loop that calls
-`client.messages.create(...)` with a list of tool definitions, checks
-`response.stop_reason`, and on `"tool_use"` runs the requested tool(s)
-locally and sends results back as `tool_result` blocks keyed by
-`tool_use_id`. Loops until the model answers with plain text instead of
-another tool call. `minimal_agent.py` at the repo root is the same loop
+`backend/app/agent.py`: a loop that calls `client.messages.create(...)`
+with a list of tool definitions, checks `response.stop_reason`, and on
+`"tool_use"` runs the requested tool(s) locally and sends results back as
+`tool_result` blocks keyed by `tool_use_id`. Loops until the model answers
+with plain text, or until 8 model turns, after which one last call with
+tools disabled forces an answer from what it has (flagged as partial in
+the UI).
+
+Each request replays the last 20 messages of the conversation, text only,
+so follow-ups like "what about Engineering?" work. Tool calls are shown in
+the UI but never sent back to the model. `minimal_agent.py` at the repo root is the same loop
 in isolation, without the Postgres/FastAPI wiring, useful for seeing the
 shape on its own.
 
@@ -130,6 +175,27 @@ matching paths, since the agent needs the policy text itself.
 The Anthropic call is synchronous, so `POST /chat` runs `run_agent` in a
 worker thread via `asyncio.to_thread` rather than making the loop async.
 This keeps the loop itself simple and only makes the call site async-aware.
+
+### Authentication
+
+The React app signs in through Auth0's hosted login (`@auth0/auth0-react`,
+authorization code + PKCE) and sends the access token as
+`Authorization: Bearer <jwt>` on every request. `backend/app/auth.py`
+verifies it against the tenant's published keys (JWKS): RS256 only, plus
+issuer, audience and expiry. It then reads the role, department and
+employee name that the post-login Action added.
+
+`get_current_user` is a FastAPI dependency on every route except
+`/health`. It upserts a local `app_user` row keyed by the token's `sub`,
+which gives conversations a foreign key and means a role change in Auth0
+applies on the user's next token. Conversations are filtered by owner, and
+someone else's conversation ID returns 404, not 403, so its existence
+isn't revealed. Each user also has a daily message cap
+(`DAILY_MESSAGE_LIMIT`, default 50) to bound API spend.
+
+Roles currently drive what the UI shows. Database-level scoping (managers
+see only their department's expenses, employees only their own) comes
+next, enforced by Postgres row-level security rather than by the prompt.
 
 ### FastAPI's async model
 

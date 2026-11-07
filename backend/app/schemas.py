@@ -31,6 +31,15 @@ class ChatResponse(BaseModel):
     message: MessageOut
 
 
+class MeOut(BaseModel):
+    id: uuid.UUID
+    email: str | None
+    display_name: str | None
+    role: str
+    department: str | None
+    employee_name: str | None
+
+
 class ConversationOut(BaseModel):
     id: uuid.UUID
     title: str
