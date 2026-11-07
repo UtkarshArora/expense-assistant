@@ -24,6 +24,8 @@ class Message(SQLModel, table=True):
     conversation_id: uuid.UUID = Field(foreign_key="conversation.id", index=True)
     role: str  # "user" | "assistant"
     content: str
+    # True when the agent hit its step limit and the reply may be partial.
+    truncated: bool = False
     created_at: NaiveDatetime = Field(default_factory=utcnow)
 
 

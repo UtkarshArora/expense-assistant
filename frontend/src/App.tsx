@@ -48,6 +48,7 @@ function App() {
       role: "user",
       content: text,
       created_at: new Date().toISOString(),
+      truncated: false,
       tool_calls: [],
     }
     setMessages((prev) => [...prev, optimisticUser])

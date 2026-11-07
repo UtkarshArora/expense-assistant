@@ -13,6 +13,8 @@ export interface Message {
   role: "user" | "assistant"
   content: string
   created_at: string
+  /** The agent hit its step limit; the reply may be partial. */
+  truncated: boolean
   tool_calls: ToolCall[]
 }
 

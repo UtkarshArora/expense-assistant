@@ -39,17 +39,19 @@ python -m pytest tests/test_sql_guard.py -k comment # one group
 
 **Request flow:** `frontend/src/api.ts` → `POST /chat` (`backend/app/routers/chat.py`) → persists the user message → runs `run_agent` in a worker thread via `asyncio.to_thread` (the SDK call is blocking) → persists the assistant message and its tool calls → returns them together.
 
-**Agent (`backend/app/agent.py`):** tool implementations, tool schemas, and a `while` loop that continues while `stop_reason == "tool_use"`, dispatching by name through `TOOL_FUNCTIONS`. Adding a tool means adding the function, its entry in `TOOL_FUNCTIONS`, and its schema in `TOOLS`.
+**Agent (`backend/app/agent.py`):** tool implementations, tool schemas, and a loop (capped at `MAX_TOOL_ITERATIONS`) that continues while `stop_reason == "tool_use"`, dispatching by name through `TOOL_FUNCTIONS`. Adding a tool means adding the function, its entry in `TOOL_FUNCTIONS`, and its schema in `TOOLS`.
 
 - `query_db` runs model-generated SQL, so it's locked down: single statement, must start with `SELECT`, forbidden-keyword regex, read-only connection, capped at 500 rows. Keep these guards if you touch it.
 - `search_files` globs `docs/` and returns full file contents (not just paths).
-- `run_agent` is stateless: it sends only the current user message. Earlier turns are stored in the DB but are **not** passed back to the model.
+- `run_agent(history, user_message)` returns `(text, tool_calls, truncated)`. `chat.py` loads the last `HISTORY_LIMIT` (20) stored messages and passes them through `build_history`, which keeps **only user/assistant text**. Tool calls are never replayed to the model (invariant 2). `build_history` also enforces role alternation: a leading assistant turn is dropped, an unanswered trailing user turn is dropped, same-role runs are merged, and empty turns are skipped.
+- The loop stops after `MAX_TOOL_ITERATIONS` (8) model turns. It then makes one more call with `tool_choice={"type": "none"}` to force an answer from the results so far, falling back to `FALLBACK_MESSAGE` if that fails. The reply is stored with `Message.truncated = True`, and the UI shows a "Partial answer" badge.
+- Tool dispatch never raises. An unknown tool, bad input or tool crash becomes an `is_error` tool_result, carrying only the exception type, not its message.
 - `SYSTEM_PROMPT` hardcodes the exact case-sensitive `category`/`status`/`department` values from `seed_expenses.sql`; update both together.
 
 **Two sets of tables in one Postgres DB:**
 
 - `expenses`: owned by `seed_expenses.sql`, mounted into `docker-entrypoint-initdb.d`. Not an ORM model.
-- `conversation`, `message`, `toolcall`: SQLModel models in `models.py`, created by `init_db()` on FastAPI startup (`create_all`, no migrations). Timestamps are naive UTC on purpose.
+- `conversation`, `message`, `toolcall`: SQLModel models in `models.py`, created by `init_db()` on FastAPI startup (`create_all`, no migrations). Timestamps are naive UTC on purpose. Because `create_all` never alters existing tables, a new column (e.g. `message.truncated`) needs `docker compose down -v` locally.
 
 **Two DB drivers from one `DATABASE_URL`:** the app uses async SQLAlchemy/asyncpg (`config.database_url_async` rewrites the scheme to `postgresql+asyncpg://`); `query_db` opens its own sync `psycopg` connection with the plain `postgresql://` URL.
 

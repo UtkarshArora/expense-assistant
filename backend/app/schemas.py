@@ -22,6 +22,7 @@ class MessageOut(BaseModel):
     role: str
     content: str
     created_at: datetime
+    truncated: bool = False
     tool_calls: list[ToolCallOut] = []
 
 

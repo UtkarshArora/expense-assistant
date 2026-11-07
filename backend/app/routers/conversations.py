@@ -70,6 +70,7 @@ async def get_conversation(
                 role=m.role,
                 content=m.content,
                 created_at=m.created_at,
+                truncated=m.truncated,
                 tool_calls=[
                     ToolCallOut(
                         id=t.id, name=t.name, input=t.input, output=t.output, created_at=t.created_at
