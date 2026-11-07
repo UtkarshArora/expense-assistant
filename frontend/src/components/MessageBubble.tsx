@@ -17,6 +17,11 @@ export function MessageBubble({ message }: { message: Message }) {
         )}
       >
         {!isUser && <ToolCallTrace toolCalls={message.tool_calls} />}
+        {!isUser && message.truncated && (
+          <span className="mb-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-400">
+            Partial answer: step limit reached
+          </span>
+        )}
         <div
           className={cn(
             "rounded-2xl px-4 py-2.5 text-sm leading-relaxed",

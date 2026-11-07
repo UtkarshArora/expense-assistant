@@ -1,14 +1,18 @@
 import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..agent import run_agent
+from ..agent import build_history, run_agent
 from ..db import get_session
 from ..models import Conversation, Message, ToolCall
 from ..schemas import ChatRequest, ChatResponse, MessageOut, ToolCallOut
 
 router = APIRouter()
+
+# How many stored messages (user + assistant) are replayed to the model.
+HISTORY_LIMIT = 20
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -19,7 +23,18 @@ async def chat(
         conversation = await session.get(Conversation, req.conversation_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        # Text only: ToolCall rows are never loaded into model context.
+        recent = (
+            await session.execute(
+                select(Message.role, Message.content)
+                .where(Message.conversation_id == conversation.id)
+                .order_by(Message.created_at.desc())
+                .limit(HISTORY_LIMIT)
+            )
+        ).all()
+        history = build_history([(r.role, r.content) for r in reversed(recent)])
     else:
+        history = []
         conversation = Conversation(title=req.message.strip()[:60] or "New conversation")
         session.add(conversation)
         await session.flush()
@@ -32,10 +47,15 @@ async def chat(
 
     # run_agent makes a blocking Anthropic SDK call, so it runs in a worker
     # thread instead of tying up the event loop.
-    final_text, tool_calls = await asyncio.to_thread(run_agent, req.message)
+    final_text, tool_calls, truncated = await asyncio.to_thread(
+        run_agent, history, req.message
+    )
 
     assistant_message = Message(
-        conversation_id=conversation.id, role="assistant", content=final_text
+        conversation_id=conversation.id,
+        role="assistant",
+        content=final_text,
+        truncated=truncated,
     )
     session.add(assistant_message)
     await session.flush()
@@ -61,6 +81,7 @@ async def chat(
             role=assistant_message.role,
             content=assistant_message.content,
             created_at=assistant_message.created_at,
+            truncated=assistant_message.truncated,
             tool_calls=[
                 ToolCallOut(
                     id=r.id, name=r.name, input=r.input, output=r.output, created_at=r.created_at
