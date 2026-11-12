@@ -11,9 +11,9 @@ Invite-only, multi-user (Auth0) chat assistant for questions about company spend
 Setup: `cp .env.example .env` at the **repo root** and set `ANTHROPIC_API_KEY`, `AUTH0_DOMAIN`, `AUTH0_AUDIENCE` (the backend loads `.env` from the repo root, not `backend/`). The frontend reads `frontend/.env.local` (`VITE_AUTH0_DOMAIN`, `VITE_AUTH0_CLIENT_ID`, `VITE_AUTH0_AUDIENCE`; see `frontend/.env.example`). If they're missing, Vite drops the whole app as dead code and the page shows a config error. Auth0 tenant setup is in README.md.
 
 ```bash
-# Postgres (seeds the `expenses` table on first boot only)
+# Postgres (on first boot only: seeds `expenses`, then db/02_security.sql adds agent_reader + RLS)
 docker compose up -d db
-docker compose down -v          # drop the volume so seed_expenses.sql re-runs
+docker compose down -v          # drop the volume so both init scripts re-run
 
 # Backend (from backend/)
 pip install -r requirements.txt
@@ -29,9 +29,12 @@ npm run lint     # oxlint
 Tests (from `backend/`, needs `pip install -r requirements-dev.txt`; no database or API key required):
 
 ```bash
-python -m pytest                                    # all
+python -m pytest                                    # all unit tests (integration deselected by pytest.ini)
 python -m pytest tests/test_sql_guard.py -k comment # one group
+python -m pytest -m integration                     # RLS tests: needs the compose DB running
 ```
+
+Integration tests (`tests/integration/test_rls.py`) run in CI against a Postgres service container with both init scripts applied. To apply `db/02_security.sql` to an existing local DB without wiping it, run `docker exec -i expense-assistant-db-1 psql -U expense_user -d expense_db < db/02_security.sql`.
 
 `tests/test_auth.py` signs RS256 tokens with a throwaway key and monkeypatches the JWKS lookup. Route tests use `app.dependency_overrides` for `get_current_user`/`get_session` and a non-context `TestClient(app)`, so the lifespan (Postgres) never runs. `conftest.py` sets test defaults for `AUTH0_DOMAIN`/`AUTH0_AUDIENCE`.
 
@@ -43,7 +46,13 @@ python -m pytest tests/test_sql_guard.py -k comment # one group
 
 **Agent (`backend/app/agent.py`):** tool implementations, tool schemas, and a loop (capped at `MAX_TOOL_ITERATIONS`) that continues while `stop_reason == "tool_use"`, dispatching by name through `TOOL_FUNCTIONS`. Adding a tool means adding the function, its entry in `TOOL_FUNCTIONS`, and its schema in `TOOLS`.
 
-- `query_db` runs model-generated SQL, so it's locked down: single statement, must start with `SELECT`, forbidden-keyword regex, read-only connection, capped at 500 rows. Keep these guards if you touch it.
+- `query_db(sql, *, scope)` runs model-generated SQL through three independent layers:
+  1. **Regex** (`app/sql_guard.py`, unchanged from the original guard). It also rejects every `WITH`, so the prompt tells the model to use subqueries.
+  2. **sqlglot AST**: one SELECT or set operation, no `INTO`, no locks, no DML/DDL anywhere in the tree, tables limited to `expenses`, and functions from an allowlist (unknown ones are rejected).
+  3. **Database**: it connects as `agent_reader` (`AGENT_DATABASE_URL`) in a read-only transaction. It first sets `app.role`/`app.department`/`app.employee` with bound `set_config(..., true)` and `SET LOCAL statement_timeout`. RLS in `db/02_security.sql` then scopes rows: admin sees all, manager their department, employee their own rows. An unknown or missing scope sees nothing.
+
+  Results are capped at 500 rows. When adding to the function allowlist, check how sqlglot classes it: `AND`/`OR`/`EXISTS` are `Func` subclasses.
+- `AccessScope` is built in `chat.py` from the authenticated `app_user`. `run_agent` passes it to tools in `SCOPED_TOOLS` at dispatch. It is not in any tool schema, and a model-supplied `scope` argument is rejected. `build_system_prompt(scope)` tells the model what the user can see. That only affects UX; RLS is the enforcement.
 - `search_files` globs `docs/` and returns full file contents (not just paths).
 - `run_agent(history, user_message)` returns `(text, tool_calls, truncated)`. `chat.py` loads the last `HISTORY_LIMIT` (20) stored messages and passes them through `build_history`, which keeps **only user/assistant text**. Tool calls are never replayed to the model (invariant 2). `build_history` also enforces role alternation: a leading assistant turn is dropped, an unanswered trailing user turn is dropped, same-role runs are merged, and empty turns are skipped.
 - The loop stops after `MAX_TOOL_ITERATIONS` (8) model turns. It then makes one more call with `tool_choice={"type": "none"}` to force an answer from the results so far, falling back to `FALLBACK_MESSAGE` if that fails. The reply is stored with `Message.truncated = True`, and the UI shows a "Partial answer" badge.
@@ -65,6 +74,6 @@ python -m pytest tests/test_sql_guard.py -k comment # one group
 
 #Invariants
 
-1. Model-generated SQL should be a read-only SQL statement, enforced by regex, never weaken this
+1. Model-generated SQL must be a single read-only SELECT, enforced in layers: regex, sqlglot AST allowlist, and a read-only least-privilege DB role with row-level security. Never weaken or remove any layer.
 2. The tool call trace should be persisted for the user to see and not passed in the model
 3. Never log API keys or raw model output containing user data

@@ -10,12 +10,13 @@ directly rather than just listing matches.
 import glob
 import json
 import os
-import re
+from dataclasses import dataclass
 
 import anthropic
 import psycopg
 
 from .config import settings
+from .sql_guard import validate_sql
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 MODEL = "claude-opus-4-8"
@@ -33,7 +34,45 @@ The 'expenses' table's text columns are case-sensitive and use these exact value
 
 If you're not sure of the exact spelling of a value (e.g. an employee name), use \
 ILIKE or run a quick SELECT DISTINCT first rather than guessing — a zero-row result \
-is more often a casing mismatch than an absence of data."""
+is more often a casing mismatch than an absence of data.
+
+query_db accepts one plain SELECT on the 'expenses' table. WITH (CTEs), other \
+tables, and server/session functions are rejected; use subqueries instead. If a \
+query is rejected, the error says why: rewrite it rather than retrying as-is."""
+
+
+@dataclass(frozen=True)
+class AccessScope:
+    """Who the agent is answering for. Set by the server, never by the model."""
+
+    role: str  # "employee" | "manager" | "admin"
+    department: str | None = None
+    employee_name: str | None = None
+
+
+def build_system_prompt(scope: AccessScope) -> str:
+    """SYSTEM_PROMPT plus who the user is and what the database will show them.
+
+    This only shapes how the model explains results. Enforcement is row-level
+    security in Postgres, which holds whatever the model writes.
+    """
+    if scope.role == "admin":
+        who = "The user is a finance admin and can see every department's expenses."
+    elif scope.role == "manager":
+        who = (
+            f"The user manages {scope.department}. The database only returns "
+            f"{scope.department} rows to them."
+        )
+    else:
+        who = (
+            f"The user is {scope.employee_name} ({scope.department or 'no department'}). "
+            "The database only returns their own expenses."
+        )
+    return (
+        f"{SYSTEM_PROMPT}\n\n{who} If they ask about data outside that, queries "
+        "return no rows: say they don't have access to it, rather than that "
+        "there was no spending."
+    )
 
 
 # ----------------------------------------------------------------------
@@ -56,29 +95,36 @@ def search_files(pattern: str) -> str:
     return "\n\n".join(parts)
 
 
-# Only a single SELECT statement is allowed — the SQL text is model-generated.
-_SELECT_RE = re.compile(r"^\s*SELECT\b", re.IGNORECASE)
-_FORBIDDEN_RE = re.compile(
-    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|"
-    r"EXEC|CALL|MERGE|ATTACH|VACUUM|COPY|SET|RESET)\b",
-    re.IGNORECASE,
+# Our own SQL, with bound parameters: puts the user's scope in transaction-
+# local settings that the row-level security policy on `expenses` reads.
+# The model can't change them: set_config/current_setting fail the AST
+# guard, and SET/RESET fail the regex.
+_SCOPE_SQL = (
+    "SELECT set_config('app.role', %s, true), "
+    "set_config('app.department', %s, true), "
+    "set_config('app.employee', %s, true)"
 )
 
 
-def query_db(sql: str) -> str:
-    """Run a single read-only SELECT against the expenses table and return rows as JSON."""
-    statement = sql.strip().rstrip(";")
-    if ";" in statement:
-        return "Error: only a single SQL statement is allowed."
-    if not _SELECT_RE.match(statement):
-        return "Error: only SELECT statements are allowed."
-    if _FORBIDDEN_RE.search(statement):
-        return "Error: statement contains a disallowed keyword."
+def query_db(sql: str, *, scope: AccessScope) -> str:
+    """Run one guarded, read-only SELECT as the user it's scoped to; rows as JSON."""
+    statement, error = validate_sql(sql)
+    if error:
+        return error
 
     try:
-        with psycopg.connect(settings.database_url) as conn:
+        # agent_reader: SELECT on `expenses` only, subject to RLS. Never the
+        # app's owner role, which can read every table.
+        with psycopg.connect(settings.agent_database_url) as conn:
             conn.read_only = True
             with conn.cursor() as cur:
+                # All three run in one transaction, so the local settings
+                # apply to the statement and vanish at commit.
+                cur.execute(
+                    _SCOPE_SQL,
+                    (scope.role, scope.department or "", scope.employee_name or ""),
+                )
+                cur.execute("SET LOCAL statement_timeout = '5s'")
                 cur.execute(statement)
                 rows = cur.fetchmany(500)
                 columns = [desc.name for desc in cur.description] if cur.description else []
@@ -94,6 +140,10 @@ TOOL_FUNCTIONS = {
     "search_files": search_files,
     "query_db": query_db,
 }
+
+# Tools that receive the caller's AccessScope as a keyword argument at
+# dispatch time. It is not in their schemas, so the model can't supply it.
+SCOPED_TOOLS = frozenset({"query_db"})
 
 
 # ----------------------------------------------------------------------
@@ -189,20 +239,28 @@ def _text_of(content) -> str:
     return "".join(block.text for block in content if block.type == "text")
 
 
-def _run_tool(name: str, tool_input: dict) -> tuple[str, bool]:
+def _run_tool(name: str, tool_input: dict, scope: AccessScope) -> tuple[str, bool]:
     """Dispatch one tool call. Returns (output, is_error); never raises."""
     func = TOOL_FUNCTIONS.get(name)
     if func is None:
         return f"Error: unknown tool {name!r}.", True
+    if not isinstance(tool_input, dict):
+        return f"Error: invalid input for {name}: expected an object.", True
+    kwargs = dict(tool_input)
+    if name in SCOPED_TOOLS:
+        # Explicit check: a model-supplied "scope" must never reach the tool.
+        if "scope" in kwargs:
+            return f"Error: invalid input for {name}: unexpected argument 'scope'.", True
+        kwargs["scope"] = scope
     try:
-        return func(**tool_input), False
+        return func(**kwargs), False
     except TypeError as e:
         return f"Error: invalid input for {name}: {e}", True
     except Exception as e:  # keep the loop alive; don't echo internals
         return f"Error: {name} failed ({type(e).__name__}).", True
 
 
-def _forced_final_answer(messages: list[dict]) -> str:
+def _forced_final_answer(messages: list[dict], system: str) -> str:
     """After the step limit, ask once more with tools disabled."""
     # The last message is the user turn carrying tool_results; text blocks may
     # follow tool_result blocks in the same turn.
@@ -214,7 +272,7 @@ def _forced_final_answer(messages: list[dict]) -> str:
         response = client.messages.create(
             model=MODEL,
             max_tokens=1024,
-            system=SYSTEM_PROMPT,
+            system=system,
             tools=TOOLS,  # still required: the history contains tool_use blocks
             tool_choice={"type": "none"},
             messages=messages,
@@ -225,9 +283,13 @@ def _forced_final_answer(messages: list[dict]) -> str:
 
 
 def run_agent(
-    history: list[dict], user_message: str
+    history: list[dict], user_message: str, scope: AccessScope
 ) -> tuple[str, list[dict], bool]:
-    """Run one turn. Returns (final_text, tool_calls, truncated)."""
+    """Run one turn for the user `scope` describes.
+
+    Returns (final_text, tool_calls, truncated).
+    """
+    system = build_system_prompt(scope)
     messages = [*history, {"role": "user", "content": user_message}]
     tool_calls: list[dict] = []
 
@@ -235,7 +297,7 @@ def run_agent(
         response = client.messages.create(
             model=MODEL,
             max_tokens=1024,
-            system=SYSTEM_PROMPT,
+            system=system,
             tools=TOOLS,
             messages=messages,
         )
@@ -249,7 +311,7 @@ def run_agent(
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            output, is_error = _run_tool(block.name, block.input)
+            output, is_error = _run_tool(block.name, block.input, scope)
             tool_calls.append({"name": block.name, "input": block.input, "output": output})
             result = {"type": "tool_result", "tool_use_id": block.id, "content": output}
             if is_error:
@@ -258,4 +320,4 @@ def run_agent(
 
         messages.append({"role": "user", "content": tool_results})
 
-    return _forced_final_answer(messages), tool_calls, True
+    return _forced_final_answer(messages, system), tool_calls, True

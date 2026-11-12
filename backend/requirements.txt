@@ -5,5 +5,7 @@ greenlet>=3.0
 asyncpg>=0.29
 psycopg[binary]>=3.2
 pyjwt[crypto]>=2.8
+# AST class names change across majors; app/sql_guard.py is tested against 30.x.
+sqlglot>=30.30,<31
 anthropic>=0.40
 python-dotenv>=1.0

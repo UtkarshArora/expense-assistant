@@ -18,6 +18,14 @@ class Settings:
         "postgresql://expense_user:expense_pass@localhost:5432/expense_db",
     )
 
+    # Used only by the agent's query_db tool: the least-privilege
+    # `agent_reader` role from db/02_security.sql (SELECT on `expenses`
+    # only, subject to row-level security). Never the owner role above.
+    agent_database_url: str = os.environ.get(
+        "AGENT_DATABASE_URL",
+        "postgresql://agent_reader:agent_reader_pass@localhost:5432/expense_db",
+    )
+
     docs_dir: Path = BASE_DIR / "docs"
 
     # Auth0: access tokens are RS256 JWTs issued by this tenant for this API.
