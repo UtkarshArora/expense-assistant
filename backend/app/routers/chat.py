@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..agent import build_history, run_agent
+from ..agent import AccessScope, build_history, run_agent
 from ..auth import get_current_user
 from ..config import settings
 from ..db import get_session
@@ -75,8 +75,12 @@ async def chat(
 
     # run_agent makes a blocking Anthropic SDK call, so it runs in a worker
     # thread instead of tying up the event loop.
+    # From the verified token (via app_user), never from the request body.
+    scope = AccessScope(
+        role=user.role, department=user.department, employee_name=user.employee_name
+    )
     final_text, tool_calls, truncated = await asyncio.to_thread(
-        run_agent, history, req.message
+        run_agent, history, req.message, scope
     )
 
     assistant_message = Message(

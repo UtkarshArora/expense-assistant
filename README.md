@@ -167,8 +167,24 @@ the UI but never sent back to the model. `minimal_agent.py` at the repo root is 
 in isolation, without the Postgres/FastAPI wiring, useful for seeing the
 shape on its own.
 
-`query_db` is locked to a single read-only `SELECT` (regex-checked, run
-in a read-only transaction) since the SQL text is model-generated.
+`query_db` runs model-generated SQL, so it passes three independent
+checks (`backend/app/sql_guard.py`, `db/02_security.sql`):
+
+1. **Regex:** one statement, starts with `SELECT`, no write or DDL keywords.
+2. **Parsed AST (sqlglot):** only `SELECT`s over the `expenses` table, and
+   only allowlisted functions. This blocks what a regex can't see, such as
+   `SELECT set_config(...)`, `SELECT ... INTO`, `pg_catalog` reads, or a
+   subquery against the users table.
+3. **The database itself:** the query runs as `agent_reader`, a role that
+   can `SELECT` from `expenses` and nothing else, in a read-only
+   transaction with a 5s statement timeout. Postgres row-level security
+   filters rows by the signed-in user's role: admins see everything,
+   managers their department, employees their own expenses. The scope is
+   set from the verified token with bound parameters, never by the model.
+
+Parameterized queries alone can't do this job: the model writes the whole
+statement, so there are no values to bind. Our own scope SQL *is*
+parameterized.
 `search_files` reads and returns file contents from `docs/`, not just
 matching paths, since the agent needs the policy text itself.
 
@@ -193,9 +209,9 @@ someone else's conversation ID returns 404, not 403, so its existence
 isn't revealed. Each user also has a daily message cap
 (`DAILY_MESSAGE_LIMIT`, default 50) to bound API spend.
 
-Roles currently drive what the UI shows. Database-level scoping (managers
-see only their department's expenses, employees only their own) comes
-next, enforced by Postgres row-level security rather than by the prompt.
+Roles also decide which expense rows the agent's SQL can see, enforced by
+Postgres row-level security (see [Agent loop](#agent-loop)) rather than by
+the prompt.
 
 ### FastAPI's async model
 
@@ -264,8 +280,6 @@ for real users.
   message is flushed before `run_agent` and committed only at the end, so
   each request holds a pooled connection for the full run. Under concurrent
   load, the default pool (5 plus 10 overflow) is the first bottleneck.
-- ** There is no `statement_timeout`, and `fetchmany(500)` limits rows returned, not the
-  work Postgres does.
 - **`query_db` opens a new connection on every call,** outside the app's
   connection pool.
 
@@ -275,9 +289,8 @@ In priority order:
 
 1. **Shorter transactions.** Commit the user message before the agent runs,
    then save the reply and tool calls in a separate short transaction.
-2. **Least-privilege queries.** Run `query_db` as a dedicated Postgres role
-   with `SELECT` on `expenses` only, add a `statement_timeout`, and reuse
-   pooled connections.
+2. **Pooled agent connections.** `query_db` now runs as a least-privilege
+   role with a statement timeout, but still opens a connection per call.
 3. **Eval suite.** 30 to 50 questions with known answers from reference SQL,
    covering DB-only, docs-only, combined, edge-case, and adversarial prompts.
    Compare query results rather than SQL text, check that the right tools

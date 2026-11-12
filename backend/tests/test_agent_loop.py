@@ -10,7 +10,19 @@ import anthropic
 import pytest
 
 from app import agent
-from app.agent import FALLBACK_MESSAGE, MAX_TOOL_ITERATIONS, build_history, run_agent
+from app.agent import (
+    FALLBACK_MESSAGE,
+    MAX_TOOL_ITERATIONS,
+    AccessScope,
+    build_history,
+    run_agent as _run_agent,
+)
+
+SCOPE = AccessScope(role="employee", department="Sales", employee_name="Marcus Chen")
+
+
+def run_agent(history, user_message):
+    return _run_agent(history, user_message, SCOPE)
 
 
 class FakeAPIError(anthropic.APIError):
@@ -236,3 +248,78 @@ def test_answer_on_last_allowed_iteration_is_not_truncated(create, fake_tool):
 
     assert create.call_count == MAX_TOOL_ITERATIONS
     assert (text, truncated) == ("made it", False)
+
+
+# ----------------------------------------------------------------------
+# run_agent: access scope
+# ----------------------------------------------------------------------
+
+def test_scope_is_injected_into_scoped_tools(create, monkeypatch):
+    scoped = MagicMock(return_value="rows")
+    monkeypatch.setitem(agent.TOOL_FUNCTIONS, "query_db", scoped)
+    create.side_effect = [tool_response("query_db", {"sql": "SELECT 1"}), text_response("done")]
+
+    run_agent([], "q")
+
+    scoped.assert_called_once_with(sql="SELECT 1", scope=SCOPE)
+
+
+def test_model_cannot_supply_its_own_scope(create, monkeypatch):
+    scoped = MagicMock(return_value="rows")
+    monkeypatch.setitem(agent.TOOL_FUNCTIONS, "query_db", scoped)
+    forged = {"sql": "SELECT 1", "scope": {"role": "admin"}}
+    create.side_effect = [tool_response("query_db", forged), text_response("ok")]
+
+    run_agent([], "q")
+
+    scoped.assert_not_called()
+    result = create.call_args.kwargs["messages"][-2]["content"][0]
+    assert result["is_error"] is True
+    assert "unexpected argument 'scope'" in result["content"]
+
+
+def test_unscoped_tools_do_not_receive_scope(create, fake_tool):
+    create.side_effect = [tool_response("fake_tool", {"x": 1}), text_response("done")]
+
+    run_agent([], "q")
+
+    fake_tool.assert_called_once_with(x=1)
+
+
+def test_non_object_tool_input_is_an_error(create, fake_tool):
+    create.side_effect = [tool_response("fake_tool", "not-a-dict"), text_response("ok")]
+
+    run_agent([], "q")
+
+    fake_tool.assert_not_called()
+    assert create.call_args.kwargs["messages"][-2]["content"][0]["is_error"] is True
+
+
+@pytest.mark.parametrize(
+    "scope, expected",
+    [
+        (AccessScope(role="admin"), "finance admin"),
+        (AccessScope(role="manager", department="Sales"), "manages Sales"),
+        (AccessScope(role="employee", department="Sales", employee_name="Marcus Chen"),
+         "Marcus Chen (Sales)"),
+    ],
+)
+def test_system_prompt_describes_the_users_scope(create, scope, expected):
+    create.return_value = text_response("ok")
+
+    _run_agent([], "q", scope)
+
+    system = create.call_args.kwargs["system"]
+    assert system.startswith(agent.SYSTEM_PROMPT)
+    assert expected in system
+    assert "don't have access" in system
+
+
+def test_forced_final_answer_keeps_the_scoped_prompt(create, fake_tool):
+    create.side_effect = [tool_response("fake_tool", {})] * MAX_TOOL_ITERATIONS + [
+        text_response("partial")
+    ]
+
+    run_agent([], "q")
+
+    assert "Marcus Chen (Sales)" in create.call_args.kwargs["system"]

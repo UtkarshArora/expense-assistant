@@ -5,9 +5,19 @@ Every rejection case also asserts psycopg.connect was never called: the
 guard's promise is that bad SQL is stopped before it reaches the database.
 """
 
+from unittest.mock import call
+
 import pytest
 
-from app.agent import query_db
+from app import agent
+from app.agent import AccessScope
+from app.config import settings
+
+SCOPE = AccessScope(role="manager", department="Sales", employee_name="Priya Nair")
+
+
+def query_db(sql: str) -> str:
+    return agent.query_db(sql, scope=SCOPE)
 
 SINGLE_STATEMENT_ERROR = "Error: only a single SQL statement is allowed."
 SELECT_ONLY_ERROR = "Error: only SELECT statements are allowed."
@@ -35,12 +45,40 @@ KEYWORD_ERROR = "Error: statement contains a disallowed keyword."
 def test_single_select_is_executed(fake_connect, sql, executed):
     assert query_db(sql) == '[{"col": 1}]'
     fake_connect.assert_called_once()
-    fake_connect.cursor.execute.assert_called_once_with(executed)
+    # The model's statement runs last, after the scope and the timeout.
+    assert fake_connect.cursor.execute.call_args_list[-1] == call(executed)
 
 
 def test_connection_is_read_only(fake_connect):
     query_db("SELECT 1")
     assert fake_connect.conn.read_only is True
+
+
+def test_connects_as_least_privilege_role(fake_connect):
+    query_db("SELECT 1")
+    fake_connect.assert_called_once_with(settings.agent_database_url)
+    assert settings.agent_database_url != settings.database_url
+
+
+def test_scope_and_timeout_are_set_before_the_statement(fake_connect):
+    query_db("SELECT amount FROM expenses")
+    calls = fake_connect.cursor.execute.call_args_list
+    assert len(calls) == 3
+    scope_sql, scope_params = calls[0].args
+    assert "set_config('app.role', %s, true)" in scope_sql
+    assert scope_params == ("manager", "Sales", "Priya Nair")  # bound, not interpolated
+    assert calls[1] == call("SET LOCAL statement_timeout = '5s'")
+    assert calls[2] == call("SELECT amount FROM expenses")
+
+
+def test_missing_scope_fields_become_empty_strings(fake_connect):
+    agent.query_db("SELECT 1", scope=AccessScope(role="admin"))
+    assert fake_connect.cursor.execute.call_args_list[0].args[1] == ("admin", "", "")
+
+
+def test_scope_is_required():
+    with pytest.raises(TypeError):
+        agent.query_db("SELECT 1")  # no scope, no query
 
 
 # ----------------------------------------------------------------------
